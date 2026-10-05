@@ -1,0 +1,117 @@
+/* Productie overzicht */
+
+.bfd-filters {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: flex-end;
+	gap: 16px;
+	padding: 16px;
+	margin: 16px 0;
+	background: #fff;
+	border: 1px solid #dcdcde;
+}
+
+.bfd-filters label {
+	font-weight: 600;
+}
+
+.bfd-filters input[type="date"],
+.bfd-filters select {
+	margin-left: 6px;
+}
+
+.bfd-statuses {
+	border: 1px solid #dcdcde;
+	padding: 4px 12px;
+	margin: 0;
+}
+
+.bfd-statuses legend {
+	font-weight: 600;
+	padding: 0 4px;
+}
+
+.bfd-statuses label {
+	display: inline-block;
+	margin-right: 12px;
+	font-weight: 400;
+}
+
+.bfd-quicklinks,
+.bfd-actions {
+	align-self: center;
+}
+
+.bfd-actions {
+	margin-left: auto;
+}
+
+.bfd-day {
+	margin: 32px 0;
+}
+
+.bfd-day h2 {
+	font-size: 20px;
+}
+
+.bfd-day-meta {
+	font-weight: 400;
+	color: #646970;
+	font-size: 14px;
+}
+
+.bfd-day h3 {
+	margin: 16px 0 4px;
+}
+
+.bfd-products {
+	max-width: 720px;
+}
+
+.bfd-products .bfd-qty {
+	width: 80px;
+	text-align: right;
+}
+
+.bfd-products td.bfd-qty {
+	text-align: right;
+	font-size: 14px;
+}
+
+.bfd-cat th {
+	background: #f0f0f1;
+	text-align: left;
+	font-size: 13px;
+	text-transform: uppercase;
+	letter-spacing: 0.5px;
+	padding: 6px 10px;
+}
+
+/* Print: alleen de inhoud, geen filters/navigation */
+@media print {
+	#adminmenumain,
+	#wpadminbar,
+	.bfd-filters,
+	.update-nag,
+	.notice {
+		display: none !important;
+	}
+
+	#wpcontent,
+	#wpbody-content {
+		margin: 0 !important;
+		padding: 0 !important;
+	}
+
+	.bfd-day {
+		page-break-before: always;
+	}
+
+	.bfd-day:first-of-type {
+		page-break-before: avoid;
+	}
+
+	.bfd-wrap table {
+		font-size: 12px;
+	}
+}
