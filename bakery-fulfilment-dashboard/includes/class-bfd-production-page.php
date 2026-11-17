@@ -11,6 +11,21 @@ class BFD_Production_Page {
 
 	const PAGE_SLUG = 'bfd-production';
 
+	/** Standaard aangevinkte statussen (ingeplande orders die gemaakt moeten worden). */
+	const DEFAULT_STATUSES = array( 'wc-ideal', 'wc-afhalen', 'wc-zakelijke-rekenin' );
+
+	/** Statussen die in de inklapbare dropdown "Overige statussen" staan. */
+	const SECONDARY_STATUSES = array(
+		'wc-pending',
+		'wc-wacht-op-betaling',
+		'wc-processing',
+		'wc-on-hold',
+		'wc-cancelled',
+		'wc-refunded',
+		'wc-failed',
+		'wc-checkout-draft',
+	);
+
 	public static function init() {
 		add_action( 'admin_menu', array( __CLASS__, 'register_menu' ) );
 		add_action( 'admin_init', array( __CLASS__, 'maybe_export_csv' ) );
@@ -62,7 +77,7 @@ class BFD_Production_Page {
 			$type = 'all';
 		}
 
-		$default_statuses = array( 'wc-processing', 'wc-on-hold', 'wc-completed' );
+		$default_statuses = self::DEFAULT_STATUSES;
 		// phpcs:ignore WordPress.Security.NonceVerification.Recommended
 		if ( isset( $_GET['bfd_status'] ) && is_array( $_GET['bfd_status'] ) ) {
 			$raw      = array_filter( $_GET['bfd_status'], 'is_string' ); // phpcs:ignore WordPress.Security.NonceVerification.Recommended
@@ -135,7 +150,16 @@ class BFD_Production_Page {
 			)
 		);
 
-		return array_merge( $orders, $fallback );
+		// Ontdubbelen op order-ID: een meta_query met OR (of dubbel opgeslagen
+		// datum-meta / HPOS-joins) kan dezelfde order meerdere keren teruggeven.
+		$unique = array();
+		foreach ( array_merge( $orders, $fallback ) as $order ) {
+			if ( $order instanceof WC_Order ) {
+				$unique[ $order->get_id() ] = $order;
+			}
+		}
+
+		return array_values( $unique );
 	}
 
 	/**
@@ -161,14 +185,23 @@ class BFD_Production_Page {
 
 			if ( ! isset( $days[ $day ] ) ) {
 				$days[ $day ] = array(
-					'orders'   => array(),
-					'products' => array(),
+					'orders'        => array(),
+					'products'      => array(), // Productie: alle orders (ook COD), alleen aantallen.
+					'revenue'       => array(), // Omzet: [cat][label] => [ qty, amount ], zonder COD.
+					'revenue_total' => 0.0,
+					'cod_count'     => 0,
 				);
+			}
+
+			$is_cod = self::is_cod( $order );
+			if ( $is_cod ) {
+				$days[ $day ]['cod_count']++;
 			}
 
 			$items_html = array();
 			foreach ( $order->get_items( 'line_item' ) as $item_id => $item ) {
-				$qty = $item->get_quantity() - abs( $order->get_qty_refunded_for_item( $item_id ) );
+				$orig_qty = (int) $item->get_quantity();
+				$qty      = $orig_qty - abs( $order->get_qty_refunded_for_item( $item_id ) );
 				if ( $qty <= 0 ) {
 					continue;
 				}
@@ -181,7 +214,24 @@ class BFD_Production_Page {
 				}
 				$days[ $day ]['products'][ $cat ][ $label ] += $qty;
 
+				// Omzet: na korting, incl. btw, naar rato van niet-terugbetaalde stuks. COD telt niet mee.
+				if ( ! $is_cod ) {
+					$line_incl = (float) $item->get_total() + (float) $item->get_total_tax();
+					$amount    = $orig_qty > 0 ? $line_incl * ( $qty / $orig_qty ) : 0.0;
+
+					if ( ! isset( $days[ $day ]['revenue'][ $cat ][ $label ] ) ) {
+						$days[ $day ]['revenue'][ $cat ][ $label ] = array( 'qty' => 0, 'amount' => 0.0 );
+					}
+					$days[ $day ]['revenue'][ $cat ][ $label ]['qty']    += $qty;
+					$days[ $day ]['revenue'][ $cat ][ $label ]['amount'] += $amount;
+				}
+
 				$items_html[] = $qty . ' × ' . $label;
+			}
+
+			$order_total = (float) $order->get_total() - (float) $order->get_total_refunded();
+			if ( ! $is_cod ) {
+				$days[ $day ]['revenue_total'] += $order_total;
 			}
 
 			$days[ $day ]['orders'][] = array(
@@ -191,6 +241,9 @@ class BFD_Production_Page {
 				'customer' => trim( $order->get_billing_first_name() . ' ' . $order->get_billing_last_name() ),
 				'items'    => $items_html,
 				'note'     => $order->get_customer_note(),
+				'is_cod'   => $is_cod,
+				'payment'  => $order->get_payment_method_title(),
+				'total'    => $order_total,
 			);
 		}
 
@@ -208,9 +261,44 @@ class BFD_Production_Page {
 			foreach ( $day['products'] as &$cat_products ) {
 				arsort( $cat_products );
 			}
+			unset( $cat_products );
+
+			ksort( $day['revenue'] );
+			foreach ( $day['revenue'] as &$cat_revenue ) {
+				uasort(
+					$cat_revenue,
+					function ( $a, $b ) {
+						return $b['amount'] <=> $a['amount'];
+					}
+				);
+			}
+			unset( $cat_revenue );
 		}
+		unset( $day );
 
 		return $days;
+	}
+
+	/**
+	 * Betalen bij afhalen (COD): afgerekend in de winkel, telt niet mee voor omzet.
+	 */
+	private static function is_cod( $order ) {
+		return 'cod' === $order->get_payment_method();
+	}
+
+	/**
+	 * Huidige tab: 'production' (standaard) of 'revenue'.
+	 */
+	private static function get_view() {
+		$view = isset( $_GET['bfd_view'] ) && is_string( $_GET['bfd_view'] ) ? sanitize_key( $_GET['bfd_view'] ) : 'production'; // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+		return in_array( $view, array( 'production', 'revenue' ), true ) ? $view : 'production';
+	}
+
+	/**
+	 * Bedrag als platte tekst (voor CSV), bijv. 12,50.
+	 */
+	private static function csv_amount( $amount ) {
+		return number_format( (float) $amount, 2, ',', '' );
 	}
 
 	/**
@@ -269,13 +357,53 @@ class BFD_Production_Page {
 		$orders = self::get_orders( $f['from'], $f['to'], $f['type'], $f['statuses'] );
 		$days   = self::organize( $orders, $f['from'], $f['to'], $f['type'] );
 
-		$filename = 'productie-' . $f['from'] . '-tot-' . $f['to'] . '.csv';
+		$view     = self::get_view();
+		$filename = ( 'revenue' === $view ? 'omzet-' : 'productie-' ) . $f['from'] . '-tot-' . $f['to'] . '.csv';
 		header( 'Content-Type: text/csv; charset=utf-8' );
 		header( 'Content-Disposition: attachment; filename=' . $filename );
 
 		$out = fopen( 'php://output', 'w' );
 		// BOM zodat Excel (NL) UTF-8 correct opent; ';' als scheidingsteken.
 		fwrite( $out, "\xEF\xBB\xBF" );
+
+		if ( 'revenue' === $view ) {
+			fputcsv( $out, array( 'OMZET PER PRODUCT (excl. betalen bij afhalen)' ), ';' );
+			fputcsv( $out, array( 'Datum', 'Categorie', 'Product', 'Aantal', 'Omzet incl. btw' ), ';' );
+			foreach ( $days as $day => $data ) {
+				foreach ( $data['revenue'] as $cat => $products ) {
+					foreach ( $products as $label => $row ) {
+						fputcsv( $out, array( $day, $cat, $label, $row['qty'], self::csv_amount( $row['amount'] ) ), ';' );
+					}
+				}
+			}
+
+			fputcsv( $out, array(), ';' );
+			fputcsv( $out, array( 'ORDERS (excl. betalen bij afhalen)' ), ';' );
+			fputcsv( $out, array( 'Datum', 'Order', 'Klant', 'Betaalmethode', 'Status', 'Totaal incl. btw' ), ';' );
+			foreach ( $days as $day => $data ) {
+				foreach ( $data['orders'] as $row ) {
+					if ( $row['is_cod'] ) {
+						continue;
+					}
+					fputcsv(
+						$out,
+						array(
+							$day,
+							'#' . $row['order']->get_order_number(),
+							$row['customer'],
+							$row['payment'],
+							wc_get_order_status_name( $row['order']->get_status() ),
+							self::csv_amount( $row['total'] ),
+						),
+						';'
+					);
+				}
+				fputcsv( $out, array( $day, 'Totaal dag', '', '', '', self::csv_amount( $data['revenue_total'] ) ), ';' );
+			}
+
+			fclose( $out );
+			exit;
+		}
 
 		fputcsv( $out, array( 'PRODUCTEN PER DAG' ), ';' );
 		fputcsv( $out, array( 'Datum', 'Categorie', 'Product', 'Aantal' ), ';' );
@@ -323,6 +451,7 @@ class BFD_Production_Page {
 		}
 
 		$f      = self::get_filters();
+		$view   = self::get_view();
 		$orders = self::get_orders( $f['from'], $f['to'], $f['type'], $f['statuses'] );
 		$days   = self::organize( $orders, $f['from'], $f['to'], $f['type'] );
 
@@ -338,6 +467,7 @@ class BFD_Production_Page {
 					'bfd_to'     => $f['to'],
 					'bfd_type'   => $f['type'],
 					'bfd_status' => $f['statuses'],
+					'bfd_view'   => $view,
 					'bfd_export' => 'csv',
 				),
 				admin_url( 'admin.php' )
@@ -348,25 +478,155 @@ class BFD_Production_Page {
 		echo '<div class="wrap bfd-wrap">';
 		echo '<h1>' . esc_html__( 'Productie overzicht', BFD_TD ) . '</h1>';
 
-		self::render_filters( $f, $today, $tomorrow, $week_end, $export_url );
+		self::render_filters( $f, $today, $tomorrow, $week_end, $export_url, $view );
+		self::render_tabs( $f, $view );
 
 		if ( empty( $days ) ) {
 			echo '<p>' . esc_html__( 'Geen orders gevonden voor deze periode.', BFD_TD ) . '</p></div>';
 			return;
 		}
 
+		if ( 'revenue' === $view ) {
+			self::render_revenue_summary( $days );
+		}
+
 		foreach ( $days as $day => $data ) {
-			self::render_day( $day, $data );
+			if ( 'revenue' === $view ) {
+				self::render_revenue_day( $day, $data );
+			} else {
+				self::render_day( $day, $data );
+			}
 		}
 
 		echo '</div>';
 	}
 
-	private static function render_filters( $f, $today, $tomorrow, $week_end, $export_url ) {
+	/**
+	 * Tabs Productie / Omzet; behoudt de huidige filters.
+	 */
+	private static function render_tabs( $f, $view ) {
+		$base = array(
+			'page'       => self::PAGE_SLUG,
+			'bfd_from'   => $f['from'],
+			'bfd_to'     => $f['to'],
+			'bfd_type'   => $f['type'],
+			'bfd_status' => $f['statuses'],
+		);
+		$tabs = array(
+			'production' => __( 'Productie', BFD_TD ),
+			'revenue'    => __( 'Omzet', BFD_TD ),
+		);
+
+		echo '<nav class="nav-tab-wrapper bfd-tabs" style="margin:16px 0;">';
+		foreach ( $tabs as $key => $label ) {
+			$url   = add_query_arg( array_merge( $base, array( 'bfd_view' => $key ) ), admin_url( 'admin.php' ) );
+			$class = 'nav-tab' . ( $view === $key ? ' nav-tab-active' : '' );
+			echo '<a href="' . esc_url( $url ) . '" class="' . esc_attr( $class ) . '">' . esc_html( $label ) . '</a>';
+		}
+		echo '</nav>';
+	}
+
+	/**
+	 * Totaaloverzicht omzet over de hele geselecteerde periode.
+	 */
+	private static function render_revenue_summary( $days ) {
+		$total     = 0.0;
+		$orders    = 0;
+		$cod_count = 0;
+		foreach ( $days as $data ) {
+			$total     += $data['revenue_total'];
+			$orders    += count( $data['orders'] ) - $data['cod_count'];
+			$cod_count += $data['cod_count'];
+		}
+
+		echo '<div class="bfd-revenue-summary" style="background:#fff;border:1px solid #c3c4c7;padding:12px 16px;margin-bottom:16px;">';
+		echo '<strong style="font-size:16px;">' . esc_html__( 'Omzet periode', BFD_TD ) . ': ' . wp_kses_post( wc_price( $total ) ) . '</strong>';
+		echo ' <span style="color:#646970;">(' . esc_html( $orders ) . ' ' . esc_html__( 'orders, incl. btw', BFD_TD ) . ')</span>';
+		if ( $cod_count ) {
+			echo '<br><small style="color:#646970;">' . esc_html(
+				sprintf(
+					/* translators: %d: aantal orders */
+					_n( '%d order met betalen bij afhalen is niet meegeteld (afgerekend in de winkel).', '%d orders met betalen bij afhalen zijn niet meegeteld (afgerekend in de winkel).', $cod_count, BFD_TD ),
+					$cod_count
+				)
+			) . '</small>';
+		}
+		echo '</div>';
+	}
+
+	/**
+	 * Omzet per dag: producten met bedragen en orders, zonder COD-orders.
+	 */
+	private static function render_revenue_day( $day, $data ) {
+		$date_label = date_i18n( 'l j F Y', strtotime( $day ) );
+		$paid_count = count( $data['orders'] ) - $data['cod_count'];
+
+		echo '<div class="bfd-day">';
+		echo '<h2>' . esc_html( $date_label ) . ' <span class="bfd-day-meta">(' . esc_html( $paid_count ) . ' ' . esc_html__( 'orders', BFD_TD ) . ' · ' . wp_kses_post( wc_price( $data['revenue_total'] ) ) . ')</span></h2>';
+
+		if ( $data['cod_count'] ) {
+			echo '<p class="description">' . esc_html(
+				sprintf(
+					/* translators: %d: aantal orders */
+					_n( '%d order met betalen bij afhalen niet meegeteld.', '%d orders met betalen bij afhalen niet meegeteld.', $data['cod_count'], BFD_TD ),
+					$data['cod_count']
+				)
+			) . '</p>';
+		}
+
+		if ( empty( $data['revenue'] ) ) {
+			echo '<p>' . esc_html__( 'Geen omzet voor deze dag (alleen betalen bij afhalen).', BFD_TD ) . '</p></div>';
+			return;
+		}
+
+		echo '<h3>' . esc_html__( 'Omzet per product', BFD_TD ) . '</h3>';
+		echo '<table class="widefat striped bfd-products"><thead><tr>';
+		echo '<th class="bfd-qty">' . esc_html__( 'Aantal', BFD_TD ) . '</th>';
+		echo '<th>' . esc_html__( 'Product', BFD_TD ) . '</th>';
+		echo '<th style="text-align:right;">' . esc_html__( 'Omzet', BFD_TD ) . '</th>';
+		echo '</tr></thead><tbody>';
+
+		$products_total = 0.0;
+		foreach ( $data['revenue'] as $cat => $products ) {
+			echo '<tr class="bfd-cat"><th colspan="3">' . esc_html( $cat ) . '</th></tr>';
+			foreach ( $products as $label => $row ) {
+				$products_total += $row['amount'];
+				echo '<tr><td class="bfd-qty"><strong>' . esc_html( $row['qty'] ) . '</strong></td><td>' . esc_html( $label ) . '</td><td style="text-align:right;">' . wp_kses_post( wc_price( $row['amount'] ) ) . '</td></tr>';
+			}
+		}
+		echo '</tbody><tfoot><tr><th colspan="2">' . esc_html__( 'Totaal producten', BFD_TD ) . '</th><th style="text-align:right;">' . wp_kses_post( wc_price( $products_total ) ) . '</th></tr></tfoot></table>';
+
+		echo '<h3>' . esc_html__( 'Orders', BFD_TD ) . '</h3>';
+		echo '<table class="widefat striped bfd-orders"><thead><tr>';
+		echo '<th>' . esc_html__( 'Order', BFD_TD ) . '</th>';
+		echo '<th>' . esc_html__( 'Klant', BFD_TD ) . '</th>';
+		echo '<th>' . esc_html__( 'Betaalmethode', BFD_TD ) . '</th>';
+		echo '<th>' . esc_html__( 'Status', BFD_TD ) . '</th>';
+		echo '<th style="text-align:right;">' . esc_html__( 'Totaal', BFD_TD ) . '</th>';
+		echo '</tr></thead><tbody>';
+
+		foreach ( $data['orders'] as $row ) {
+			if ( $row['is_cod'] ) {
+				continue;
+			}
+			$order = $row['order'];
+			echo '<tr>';
+			echo '<td><a href="' . esc_url( $order->get_edit_order_url() ) . '">#' . esc_html( $order->get_order_number() ) . '</a></td>';
+			echo '<td>' . esc_html( $row['customer'] ) . '</td>';
+			echo '<td>' . esc_html( $row['payment'] ) . '</td>';
+			echo '<td>' . esc_html( wc_get_order_status_name( $order->get_status() ) ) . '</td>';
+			echo '<td style="text-align:right;">' . wp_kses_post( wc_price( $row['total'] ) ) . '</td>';
+			echo '</tr>';
+		}
+		echo '</tbody><tfoot><tr><th colspan="4">' . esc_html__( 'Totaal orders (incl. verzendkosten)', BFD_TD ) . '</th><th style="text-align:right;">' . wp_kses_post( wc_price( $data['revenue_total'] ) ) . '</th></tr></tfoot></table></div>';
+	}
+
+	private static function render_filters( $f, $today, $tomorrow, $week_end, $export_url, $view = 'production' ) {
 		$statuses = wc_get_order_statuses();
 
 		echo '<form method="get" class="bfd-filters">';
 		echo '<input type="hidden" name="page" value="' . esc_attr( self::PAGE_SLUG ) . '" />';
+		echo '<input type="hidden" name="bfd_view" value="' . esc_attr( $view ) . '" />';
 
 		echo '<label>' . esc_html__( 'Van', BFD_TD ) . ' <input type="date" name="bfd_from" value="' . esc_attr( $f['from'] ) . '" /></label>';
 		echo '<label>' . esc_html__( 't/m', BFD_TD ) . ' <input type="date" name="bfd_to" value="' . esc_attr( $f['to'] ) . '" /></label>';
@@ -382,19 +642,45 @@ class BFD_Production_Page {
 		}
 		echo '</select></label>';
 
-		echo '<fieldset class="bfd-statuses"><legend>' . esc_html__( 'Statussen', BFD_TD ) . '</legend>';
+		$primary   = array();
+		$secondary = array();
 		foreach ( $statuses as $key => $label ) {
+			if ( in_array( $key, self::SECONDARY_STATUSES, true ) ) {
+				$secondary[ $key ] = $label;
+			} else {
+				$primary[ $key ] = $label;
+			}
+		}
+
+		$render_checkbox = function ( $key, $label ) use ( $f ) {
 			$checked = in_array( $key, $f['statuses'], true ) ? ' checked' : '';
 			echo '<label><input type="checkbox" name="bfd_status[]" value="' . esc_attr( $key ) . '"' . $checked . ' /> ' . esc_html( $label ) . '</label>';
+		};
+
+		echo '<fieldset class="bfd-statuses"><legend>' . esc_html__( 'Statussen', BFD_TD ) . '</legend>';
+		foreach ( $primary as $key => $label ) {
+			$render_checkbox( $key, $label );
+		}
+
+		if ( ! empty( $secondary ) ) {
+			// Openklappen als er een overige status is aangevinkt, zodat de selectie zichtbaar blijft.
+			$open = array_intersect( array_keys( $secondary ), $f['statuses'] ) ? ' open' : '';
+			echo '<details class="bfd-statuses-more"' . $open . ' style="margin-top:6px;">';
+			echo '<summary style="cursor:pointer;">' . esc_html__( 'Overige statussen', BFD_TD ) . '</summary>';
+			echo '<div style="margin-top:4px;">';
+			foreach ( $secondary as $key => $label ) {
+				$render_checkbox( $key, $label );
+			}
+			echo '</div></details>';
 		}
 		echo '</fieldset>';
 
 		submit_button( __( 'Toon', BFD_TD ), 'primary', 'submit', false );
 
 		echo '<span class="bfd-quicklinks">';
-		echo '<a href="' . esc_url( add_query_arg( array( 'page' => self::PAGE_SLUG, 'bfd_from' => $today, 'bfd_to' => $today ), admin_url( 'admin.php' ) ) ) . '">' . esc_html__( 'Vandaag', BFD_TD ) . '</a> · ';
-		echo '<a href="' . esc_url( add_query_arg( array( 'page' => self::PAGE_SLUG, 'bfd_from' => $tomorrow, 'bfd_to' => $tomorrow ), admin_url( 'admin.php' ) ) ) . '">' . esc_html__( 'Morgen', BFD_TD ) . '</a> · ';
-		echo '<a href="' . esc_url( add_query_arg( array( 'page' => self::PAGE_SLUG, 'bfd_from' => $today, 'bfd_to' => $week_end ), admin_url( 'admin.php' ) ) ) . '">' . esc_html__( 'Komende 7 dagen', BFD_TD ) . '</a>';
+		echo '<a href="' . esc_url( add_query_arg( array( 'page' => self::PAGE_SLUG, 'bfd_from' => $today, 'bfd_to' => $today, 'bfd_view' => $view ), admin_url( 'admin.php' ) ) ) . '">' . esc_html__( 'Vandaag', BFD_TD ) . '</a> · ';
+		echo '<a href="' . esc_url( add_query_arg( array( 'page' => self::PAGE_SLUG, 'bfd_from' => $tomorrow, 'bfd_to' => $tomorrow, 'bfd_view' => $view ), admin_url( 'admin.php' ) ) ) . '">' . esc_html__( 'Morgen', BFD_TD ) . '</a> · ';
+		echo '<a href="' . esc_url( add_query_arg( array( 'page' => self::PAGE_SLUG, 'bfd_from' => $today, 'bfd_to' => $week_end, 'bfd_view' => $view ), admin_url( 'admin.php' ) ) ) . '">' . esc_html__( 'Komende 7 dagen', BFD_TD ) . '</a>';
 		echo '</span>';
 
 		echo '<span class="bfd-actions">';
